@@ -6,7 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.graphics.Color
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,21 +14,13 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.OpenableColumns
-import android.view.Gravity
-import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import com.gdautomusic.Ui.BG
-import com.gdautomusic.Ui.CARD
-import com.gdautomusic.Ui.ORANGE
-import com.gdautomusic.Ui.RED
 
 class MainActivity : AppCompatActivity() {
 
@@ -36,20 +28,28 @@ class MainActivity : AppCompatActivity() {
         const val GD_PACKAGE = "com.robtopx.geometryjump"
     }
 
-    private var svc: MusicService? = null
-    private val ui = Handler(Looper.getMainLooper())
-    private val prefs by lazy { getSharedPreferences("gd", Context.MODE_PRIVATE) }
+    var svc: MusicService? = null
+    val ui = Handler(Looper.getMainLooper())
+    val prefs by lazy { getSharedPreferences("gd", Context.MODE_PRIVATE) }
+    var pendingLaunch = false
+    var dragging = false
 
-    private lateinit var trackTitle: TextView
-    private lateinit var timeText: TextView
-    private lateinit var seek: SeekBar
-    private lateinit var playBtn: Button
-    private var dragging = false
+    lateinit var trackTitle: TextView
+    lateinit var timeText: TextView
+    lateinit var seek: SeekBar
+    lateinit var playBtn: Button
+    lateinit var detVal: TextView
+    lateinit var stateVal: TextView
+    lateinit var autoVal: TextView
+    lateinit var resetVal: TextView
+    lateinit var errText: TextView
+    lateinit var detBtn: Button
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(n: ComponentName, b: IBinder) {
             val s = (b as MusicService.LocalBinder).service
             svc = s
+            Bus.music = s
             s.onError = { msg -> runOnUiThread { toast(msg) } }
             s.player.volume = prefs.getInt("vol", 100) / 100f
             s.setLoop(prefs.getBoolean("loop", true))
@@ -60,10 +60,11 @@ class MainActivity : AppCompatActivity() {
 
         override fun onServiceDisconnected(n: ComponentName) {
             svc = null
+            Bus.music = null
         }
     }
 
-    private val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@registerForActivityResult
         try {
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -74,6 +75,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val capture = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val data = r.data
+        if (r.resultCode == RESULT_OK && data != null) {
+            val i = Intent(this, DetectService::class.java)
+            i.putExtra("code", r.resultCode)
+            i.putExtra("data", data)
+            ContextCompat.startForegroundService(this, i)
+        } else {
+            toast("Screen capture permission denied. Detection is off.")
+        }
+        if (pendingLaunch) {
+            pendingLaunch = false
+            launchGd()
+        }
+    }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -86,12 +103,24 @@ class MainActivity : AppCompatActivity() {
                 timeText.text = "${Ui.fmt(p.currentPosition)} / ${Ui.fmt(dur)}"
                 playBtn.text = if (p.isPlaying) "PAUSE" else "PLAY"
             }
+            val on = Bus.running
+            detVal.text = if (on) "ACTIVE" else "INACTIVE"
+            detVal.setTextColor(if (on) Ui.OK else Ui.DIM)
+            stateVal.text = Bus.state
+            autoVal.text = if (Bus.autoReset) "ON" else "OFF"
+            resetVal.text = Bus.resets.toString()
+            detBtn.text = if (on) "STOP DETECTION" else "START DETECTION"
+            errText.text = Bus.error ?: ""
             ui.postDelayed(this, 300)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Bus.autoReset = prefs.getBoolean("auto", true)
+        Bus.pauseInEditor = prefs.getBoolean("pause", true)
+        Bus.sens = prefs.getInt("sens", 5)
+        Bus.cooldownMs = prefs.getInt("cool", 1200)
         buildUi()
 
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -113,97 +142,24 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    private fun buildUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(BG)
-            setPadding(40, 80, 40, 40)
+    private fun mpm() = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+    fun toggleDetect() {
+        pendingLaunch = false
+        if (Bus.running) {
+            stopService(Intent(this, DetectService::class.java))
+        } else {
+            capture.launch(mpm().createScreenCaptureIntent())
         }
+    }
 
-        root.addView(TextView(this).apply {
-            text = "GD AUTO MUSIC RESET"
-            setTextColor(ORANGE)
-            textSize = 16f
-            letterSpacing = 0.15f
-        })
-
-        trackTitle = TextView(this).apply {
-            text = "No music selected"
-            setTextColor(Color.WHITE)
-            textSize = 24f
-            setPadding(0, 60, 0, 40)
-            maxLines = 3
+    fun launchFlow() {
+        if (Bus.running) {
+            launchGd()
+        } else {
+            pendingLaunch = true
+            capture.launch(mpm().createScreenCaptureIntent())
         }
-        root.addView(trackTitle)
-
-        seek = SeekBar(this)
-        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                if (fromUser) svc?.player?.seekTo(p.toLong())
-            }
-
-            override fun onStartTrackingTouch(s: SeekBar) {
-                dragging = true
-            }
-
-            override fun onStopTrackingTouch(s: SeekBar) {
-                dragging = false
-            }
-        })
-        root.addView(seek)
-
-        timeText = TextView(this).apply {
-            text = "0:00 / 0:00"
-            setTextColor(Color.LTGRAY)
-            gravity = Gravity.END
-        }
-        root.addView(timeText)
-
-        playBtn = btn("PLAY", RED) { svc?.togglePlay() }
-        root.addView(row(
-            playBtn,
-            btn("RESET", RED) { svc?.resetToZero() },
-            btn("STOP", CARD) {
-                svc?.player?.pause()
-                svc?.player?.seekTo(0)
-            }
-        ))
-
-        root.addView(row(btn("PICK MP3", CARD) { picker.launch(arrayOf("audio/*")) }))
-
-        root.addView(TextView(this).apply {
-            text = "Volume"
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 40, 0, 0)
-        })
-        root.addView(SeekBar(this).apply {
-            max = 100
-            progress = prefs.getInt("vol", 100)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                    svc?.player?.volume = p / 100f
-                    prefs.edit().putInt("vol", p).apply()
-                }
-
-                override fun onStartTrackingTouch(s: SeekBar) {}
-                override fun onStopTrackingTouch(s: SeekBar) {}
-            })
-        })
-
-        root.addView(CheckBox(this).apply {
-            text = "Loop"
-            setTextColor(Color.WHITE)
-            isChecked = prefs.getBoolean("loop", true)
-            setOnCheckedChangeListener { _, on ->
-                svc?.setLoop(on)
-                prefs.edit().putBoolean("loop", on).apply()
-            }
-        })
-
-        root.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
-        root.addView(row(btn("LAUNCH GEOMETRY DASH", ORANGE) { launchGd() }))
-
-        setContentView(root)
     }
 
     private fun launchGd() {
@@ -212,7 +168,6 @@ class MainActivity : AppCompatActivity() {
             toast("Geometry Dash is not installed")
             return
         }
-        svc?.resetToZero()
         startActivity(i)
     }
 
@@ -225,10 +180,6 @@ class MainActivity : AppCompatActivity() {
         contentResolver.query(u, null, null, null, null)?.use { c ->
             if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
         } ?: "Unknown file"
-
-    private fun btn(t: String, color: Int, f: () -> Unit) = Ui.btn(this, t, color, f)
-
-    private fun row(vararg v: View) = Ui.row(this, *v)
 
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
 }
